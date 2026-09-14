@@ -366,12 +366,19 @@ const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsI
   const submit = document.getElementById("submit");
   const message = document.getElementById("message");
 
-  // Le jeton de réinitialisation arrive dans l'ancre de l'URL (#access_token=...),
-  // déposé par le lien du mail envoyé par Supabase.
-  const params = new URLSearchParams(location.hash.slice(1));
-  const token = params.get("access_token");
+  /* Le jeton et l'adresse arrivent en paramètres de requête (?email=...&token=...),
+     déposés par le modèle d'email personnalisé — voir la note en bas de fichier.
+     Volontairement, on ne les échange PAS ici : le simple chargement de la page ne
+     doit consommer aucun jeton. C'est le seul moyen fiable d'empêcher un scanner de
+     sécurité (Safe Links, antivirus de messagerie…) de griller le lien avant que
+     l'utilisateur ne clique dessus pour de vrai — voir la documentation Supabase sur
+     le « prefetching » des liens d'email. L'échange n'a lieu qu'à la soumission du
+     formulaire, donc uniquement sur une vraie interaction humaine. */
+  const params = new URLSearchParams(location.search);
+  const email = params.get("email");
+  const recoveryToken = params.get("token");
 
-  if (!token || params.get("type") !== "recovery") {
+  if (!email || !recoveryToken) {
     message.className = "message error";
     message.textContent = "Lien invalide ou expiré. Demandez un nouveau mail de réinitialisation.";
     password.disabled = true;
@@ -389,7 +396,7 @@ const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsI
     Object.entries(rules).forEach(([id, test]) => {
       document.getElementById(id).classList.toggle("ok", test(password.value));
     });
-    submit.disabled = !Object.values(rules).every(test => test(password.value)) || !token;
+    submit.disabled = !Object.values(rules).every(test => test(password.value)) || !email || !recoveryToken;
   }
 
   password.addEventListener("input", updateRules);
@@ -414,16 +421,38 @@ const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsI
     }
 
     submit.disabled = true;
-    submit.textContent = "Enregistrement…";
+    submit.textContent = "Vérification…";
     message.className = "message";
     message.textContent = "";
 
     try {
+      /* Étape 1 — on échange le jeton contre une vraie session, seulement
+         maintenant : c'est ce seul appel qui consomme le jeton à usage unique.
+         Équivalent REST de supabase.auth.verifyOtp({ email, token, type:'recovery' }). */
+      const rv = await fetch(SUPABASE_URL + "/auth/v1/verify", {
+        method: "POST",
+        headers: { "apikey": ANON_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "recovery", email: email, token: recoveryToken }),
+      });
+      const session = await rv.json().catch(() => ({}));
+
+      if (!rv.ok || !session.access_token) {
+        message.className = "message error";
+        message.textContent = "Lien invalide ou expiré : " +
+          (session.msg || session.error_description || session.message || ("erreur " + rv.status)) +
+          " Demandez un nouveau mail de réinitialisation.";
+        submit.disabled = false;
+        submit.textContent = "Réinitialiser le mot de passe";
+        return;
+      }
+
+      /* Étape 2 — le jeton est validé, on peut enregistrer le mot de passe. */
+      submit.textContent = "Enregistrement…";
       const r = await fetch(SUPABASE_URL + "/auth/v1/user", {
         method: "PUT",
         headers: {
           "apikey": ANON_KEY,
-          "Authorization": "Bearer " + token,
+          "Authorization": "Bearer " + session.access_token,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ password: password.value }),
